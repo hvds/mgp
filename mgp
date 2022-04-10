@@ -1,0 +1,146 @@
+#!/usr/bin/perl -w
+use strict;
+
+my $opt_t = 0;	# threaded
+my $opt_C = 0;	# 0:gcc, 1:clang, 2:icc
+my $opt_F = 0;	# 0:no fuzz, 1:American Fuzzy Lop
+# run with: ASAN_SYMBOLIZER_PATH=/usr/lib/llvm-6.0/bin/llvm-symbolizer
+my $opt_p = 0;	# 1:sanitize=address, 2:sanitize=undefined
+my $opt_d = 0;	# debugging
+my $opt_l = 0;	# dry-run
+my $opt_i = 0;	# install
+my $opt_I;		# install path
+my $opt_3 = 0;	# use 32-bit everything
+my $opt_6 = 0;	# use64bitall
+my $opt_9 = 0;	# gcc-9
+my $opt_0 = 0;	# disable optimization
+my @opt_D;		# defines
+my @opt_A;		# additional defines, eg -Accflags="-DFOO -DBAR"
+my @opt_U;		# undefines
+
+my $path = ask_git_toplevel() // '/src/perl/git'; # if not in a git repo
+my $fuzz_path = '/opt/afl/bin';
+
+while (@ARGV && $ARGV[0] =~ /^-/) {
+	my $arg = shift @ARGV;
+	last if $arg eq '--';
+	unshift @ARGV, "-$2" if $arg =~ s{^(-.)(.+)}{$1}s;
+	$opt_t = 1 - $opt_t, next if $arg eq '-t';
+	++$opt_C, next if $arg eq '-C';
+	$opt_F = 1 - $opt_F, next if $arg eq '-F';
+	$opt_d = 1 - $opt_d, next if $arg eq '-d';
+	$opt_i = 1 - $opt_i, next if $arg eq '-i';
+	$opt_3 = 1 - $opt_3, next if $arg eq '-3';
+	$opt_6 = 1 - $opt_6, next if $arg eq '-6';
+	$opt_9 = 1 - $opt_9, next if $arg eq '-9';
+	push(@opt_D, shift =~ s/^-//r), next if $arg eq '-D';
+	push(@opt_A, shift =~ s/^-//r), next if $arg eq '-A';
+	push(@opt_U, shift =~ s/^-//r), next if $arg eq '-U';
+	++$opt_p, next if $arg eq '-p';
+	$opt_l = 1, next if $arg eq '-l';	# not a toggle, for safety
+	$opt_0 = 1, next if $arg eq '-0';
+	($opt_I = shift =~ s/^-//r), next if $arg eq '-I';
+	die "Unknown option: '$arg'";
+}
+
+my $install_path = $opt_i ? discern_path() : 'scratch';
+my $poison = ($opt_p > 1) ? 'undefined' : 'address';
+my $opt_level = $opt_0 ? 0 : $opt_C ? 3 : 6;
+my $choose_compiler = sprintf '-Dcc=%s', compiler();
+my @config_params = (
+	'-des',
+	$choose_compiler,
+	"-Dprefix=/opt/$install_path",
+#	"-Accflags='-Winline -funit-at-a-time'",
+	($opt_p ? (
+		"-Accflags='-DPERL_POISON -Werror=declaration-after-statement -fsanitize=$poison'",
+		"-Aldflags='-fsanitize=$poison'",
+	) : ()),
+	"-Doptimize='-g -O$opt_level'",
+	($opt_t ? ('-Dusethread', '-Duseithreads') : ()),
+	(($opt_d && !$opt_3) ? ('-DDEBUGGING') : ()),
+	($opt_6 ? ('-Duse64bitall') : ()),
+	(($opt_3 && $opt_d) ? (
+		# no idea how these will interact with other options
+		"-DDEBUGGING",
+		"-Accflags='-ggdb3 -m32'",
+		"-Aldflags='-ggdb3 -m32'",
+		"-Alddlflags='-shared -ggdb3 -m32'",
+	) : ()),
+	(($opt_3 && !$opt_d) ? (
+		# no idea how these will interact with other options
+        "-Accflags='-m32'",
+        "-Aldflags='-m32'",
+        "-Alddlflags='-shared -m32'",
+    ) : ()),
+	map("-D" . $_, @opt_D),
+	map("-A" . $_, @opt_A),
+	map("-U" . $_, @opt_U),
+	'-Dusedevel',
+	'-Uversiononly',
+);
+exit configure(\@config_params);
+
+sub configure {
+	my $params = join ' ', @{ $_[0] };
+	do_system("cd $path && git clean -dfx") and die "clean failed";
+	return do_system("cd $path && ./Configure $params");
+}
+
+sub compiler {
+	my $prefer = ($opt_C == 2) ? 'icc'
+			: $opt_C ? 'clang' : $opt_9 ? 'gcc-9' : 'gcc';
+	$prefer = "$fuzz_path/afl-$prefer" if $opt_F;
+	return $prefer;
+}
+
+sub do_system {
+	my($cmd) = @_;
+	print "-- $cmd\n";
+	if ($opt_l) {
+		return 0;
+	} else {
+		system($cmd);
+		return $?;
+	}
+}
+
+sub discern_path {
+	return $opt_I if defined $opt_I;
+	my $branch = ask_git_branch();
+	my $opts = join '', (
+		't' x $opt_t,
+		'd' x $opt_d,
+		'p' x $opt_p,
+		'0' x $opt_0,
+	);
+	join '-', $branch, ($opt_F ? 'fuzz' : ()), ($opt_C ? 'clang' : ()),
+			($opt_9 ? 'gcc9' : ()), ($opts ? $opts : ());
+}
+
+sub ask_git_branch {
+	my $status = `cd $path && git status`;
+	my $branch;
+	if ($status =~ m{^On branch (\S+)$}m) {
+		$branch = $1;
+		$branch =~ s{/}{-}g;
+	} elsif ($status =~ m{^HEAD detached at ([0-9a-f]+)$}m) {
+		$branch = "g$1";
+	} elsif ($status =~ m{^HEAD detached at (v[0-9.]+)$}m) {
+		$branch = $1;	# maint branch tag
+	} else {
+		die "Can't discern branch from status:\n$status";
+	}
+	if ($status =~ m{nothing to commit, working (tree|directory) clean}) {
+		return $branch;
+	} else {
+		warn "status: <$status>\n";
+		die "Can't choose install path, working directory not clean";
+	}
+}
+
+sub ask_git_toplevel {
+	my $path = `git rev-parse --show-toplevel` // '';
+	chomp $path;
+	return $path;
+}
